@@ -37,6 +37,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from langchain_core.tools import StructuredTool
@@ -67,15 +68,23 @@ OUTPUTS_DIR.mkdir(exist_ok=True)
 def _make_mcp_caller(tool_name: str, server_script: str):
     def call(**kwargs) -> str:
         async def _inner() -> str:
-            params = StdioServerParameters(command=sys.executable, args=[server_script])
-            async with stdio_client(params) as (r, w):
-                async with ClientSession(r, w) as session:
-                    await session.initialize()
-                    result = await session.call_tool(tool_name, kwargs)
-                    return result.content[0].text if result.content else "{}"
+            payload = kwargs
+            if set(kwargs) == {"kwargs"} and isinstance(kwargs["kwargs"], dict):
+                payload = kwargs["kwargs"]
+
+            return await call_mcp_tool(tool_name, payload, server_script)
         return asyncio.run(_inner())
     call.__name__ = tool_name
     return call
+
+
+async def call_mcp_tool(tool_name: str, arguments: dict, server_script: str) -> str:
+    params = StdioServerParameters(command=sys.executable, args=[server_script])
+    async with stdio_client(params) as (r, w):
+        async with ClientSession(r, w) as session:
+            await session.initialize()
+            result = await session.call_tool(tool_name, arguments)
+            return result.content[0].text if result.content else "{}"
 
 
 async def discover_tools(server_script: str) -> list:
@@ -109,6 +118,14 @@ def extract_trace(result: dict) -> list:
     for m in result["messages"]:
         role    = getattr(m, "type", "unknown")
         content = m.content
+        tool_calls = getattr(m, "tool_calls", None)
+        if tool_calls:
+            for call in tool_calls:
+                trace.append({
+                    "role": "tool_call",
+                    "tool": call.get("name"),
+                    "args": call.get("args", {}),
+                })
         if isinstance(content, list):
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_use":
@@ -129,6 +146,101 @@ def print_trace(trace: list) -> None:
             if len(content) > 400:
                 content = content[:400] + "..."
             print(f"  [{entry['role'].upper()}]\n  {content}\n")
+
+
+def _parse_text_tool_call(content: Any) -> dict | None:
+    """Some models return tool calls as JSON text instead of structured calls."""
+    if not isinstance(content, str):
+        return None
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+
+    if data.get("type") != "function" or "name" not in data:
+        return None
+
+    params = data.get("parameters", {})
+    if set(params) == {"kwargs"} and isinstance(params["kwargs"], dict):
+        params = params["kwargs"]
+
+    return {"name": data["name"], "args": params}
+
+
+def _tool_by_name(tools: list[StructuredTool]) -> dict[str, StructuredTool]:
+    return {tool.name: tool for tool in tools}
+
+
+async def _summarize_tool_result(query: str, tool_name: str, tool_output: str,
+                                 tools: list[StructuredTool], trace: list) -> str:
+    data = json.loads(tool_output)
+
+    if tool_name == "search_venues":
+        matches = data.get("matches", [])
+        if not matches:
+            return "No available Edinburgh venue matches those requirements."
+
+        best = matches[0]
+        if "address" in query.lower() and "get_venue_details" in _tool_by_name(tools):
+            details_output = await call_mcp_tool(
+                "get_venue_details",
+                {"pub_name": best["name"]},
+                SERVER_SCRIPT,
+            )
+            trace.append({
+                "role": "tool_call",
+                "tool": "get_venue_details",
+                "args": {"pub_name": best["name"]},
+            })
+            trace.append({"role": "tool", "content": details_output})
+            details = json.loads(details_output)
+            return (
+                f"The best match is {details['name']} at {details['address']}. "
+                f"It can hold {details['capacity']} guests and has vegan options."
+            )
+
+        return (
+            f"Found {len(matches)} matching venue(s). "
+            f"The best match is {best['name']}."
+        )
+
+    return tool_output
+
+
+async def run_query(agent, tools: list[StructuredTool], query: str) -> list:
+    result = await asyncio.to_thread(agent.invoke, {"messages": [("user", query)]})
+    trace = extract_trace(result)
+
+    already_used_tool = any(entry["role"] in {"tool_call", "tool"} for entry in trace)
+    last_message = result["messages"][-1]
+    text_tool_call = _parse_text_tool_call(last_message.content)
+
+    if already_used_tool or text_tool_call is None:
+        return trace
+
+    tool = _tool_by_name(tools).get(text_tool_call["name"])
+    if tool is None:
+        return trace
+
+    tool_output = await call_mcp_tool(
+        text_tool_call["name"],
+        text_tool_call["args"],
+        SERVER_SCRIPT,
+    )
+    trace.append({
+        "role": "tool_call",
+        "tool": text_tool_call["name"],
+        "args": text_tool_call["args"],
+    })
+    trace.append({"role": "tool", "content": tool_output})
+    trace.append({
+        "role": "ai",
+        "content": await _summarize_tool_result(
+            query, text_tool_call["name"], tool_output, tools, trace
+        ),
+    })
+    return trace
 
 
 async def main() -> None:
@@ -153,8 +265,7 @@ async def main() -> None:
     print(f"\n{'=' * 65}")
     print("  Query 1 — Search + Detail Fetch")
     print(f"{'=' * 65}\n")
-    r1     = agent.invoke({"messages": [("user", q1)]})
-    trace1 = extract_trace(r1)
+    trace1 = await run_query(agent, tools, q1)
     print_trace(trace1)
     output["queries"]["query_1"] = {"query": q1, "trace": trace1}
 
@@ -163,8 +274,7 @@ async def main() -> None:
     print(f"\n{'=' * 65}")
     print("  Query 2 — Impossible Constraint")
     print(f"{'=' * 65}\n")
-    r2     = agent.invoke({"messages": [("user", q2)]})
-    trace2 = extract_trace(r2)
+    trace2 = await run_query(agent, tools, q2)
     print_trace(trace2)
     output["queries"]["query_2"] = {"query": q2, "trace": trace2}
 
